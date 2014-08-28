@@ -15,4 +15,4 @@
 
 SRC += $(MALI_PLATFORM_THIRDPARTY_DIR)/mali_kbase_config_chromebook.c
 
-obj-y += mali_kbase_config_chromebook.o
+obj-y += $(MALI_PLATFORM_THIRDPARTY_DIR)/mali_kbase_config_chromebook.o
