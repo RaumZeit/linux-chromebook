@@ -57,6 +57,25 @@
 #define L2_AUX_VAL 0x7C470001
 #define L2_AUX_MASK 0xC200ffff
 
+extern bool exynos_lot_id;
+EXPORT_SYMBOL(exynos_lot_id);
+
+extern unsigned int get_match_volt(enum asv_type_id target_type,
+					unsigned int target_freq);
+EXPORT_SYMBOL(get_match_volt);
+
+extern unsigned long samsung_cpu_id;
+EXPORT_SYMBOL(samsung_cpu_id);
+
+extern int exynos_asv_group_get(enum asv_type_id asv_type_id);
+EXPORT_SYMBOL(exynos_asv_group_get);
+
+extern bool exynos5420_is_g3d_mp6(void);
+EXPORT_SYMBOL(exynos5420_is_g3d_mp6);
+
+extern unsigned int exynos_result_of_asv;
+EXPORT_SYMBOL(exynos_result_of_asv);
+
 static const char name_exynos4210[] = "EXYNOS4210";
 static const char name_exynos4212[] = "EXYNOS4212";
 static const char name_exynos4412[] = "EXYNOS4412";
