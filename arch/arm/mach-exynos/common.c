@@ -35,6 +35,7 @@
 #include <asm/mach/irq.h>
 #include <asm/cacheflush.h>
 
+#include <mach/asv-exynos.h>
 #include <mach/regs-irq.h>
 #include <mach/regs-pmu.h>
 #include <mach/regs-gpio.h>
