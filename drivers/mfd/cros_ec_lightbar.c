@@ -244,7 +244,7 @@ static ssize_t store_rgb(struct device *dev, struct device_attribute *attr,
 	return (ok && i == 0) ? count : -EINVAL;
 }
 
-static const char const *seqname[] = {
+static const char *seqname[] = {
 	"ERROR", "S5", "S3", "S0", "S5S3", "S3S0",
 	"S0S3", "S3S5", "STOP", "RUN", "PULSE", "TEST", "KONAMI",
 };
