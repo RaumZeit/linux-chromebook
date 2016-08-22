@@ -37,7 +37,6 @@
 #include <mali_midg_regmap.h>
 #include <mali_kbase_cache_policy.h>
 #include <mali_kbase_hw.h>
-#include <mali_kbase_gator.h>
 #include <mali_kbase_hwaccess_time.h>
 #include <mali_kbase_tlstream.h>
 
@@ -611,6 +610,12 @@ int kbase_region_tracker_init_jit(struct kbase_context *kctx, u64 jit_va_pages)
 		goto fail_unlock;
 	}
 
+	if (same_va->nr_pages < jit_va_pages ||
+			kctx->same_va_end < jit_va_pages) {
+		err = -ENOMEM;
+		goto fail_unlock;
+	}
+
 	/* It's safe to adjust the same VA zone now */
 	same_va->nr_pages -= jit_va_pages;
 	kctx->same_va_end -= jit_va_pages;
@@ -789,41 +794,6 @@ void kbase_free_alloced_region(struct kbase_va_region *reg)
 }
 
 KBASE_EXPORT_TEST_API(kbase_free_alloced_region);
-
-void kbase_mmu_update(struct kbase_context *kctx)
-{
-	KBASE_DEBUG_ASSERT(NULL != kctx);
-	lockdep_assert_held(&kctx->kbdev->js_data.runpool_irq.lock);
-	/* ASSERT that the context has a valid as_nr, which is only the case
-	 * when it's scheduled in.
-	 *
-	 * as_nr won't change because the caller has the runpool_irq lock */
-	KBASE_DEBUG_ASSERT(kctx->as_nr != KBASEP_AS_NR_INVALID);
-	lockdep_assert_held(&kctx->kbdev->as[kctx->as_nr].transaction_mutex);
-
-	kctx->kbdev->mmu_mode->update(kctx);
-}
-
-KBASE_EXPORT_TEST_API(kbase_mmu_update);
-
-void kbase_mmu_disable(struct kbase_context *kctx)
-{
-	KBASE_DEBUG_ASSERT(NULL != kctx);
-	/* ASSERT that the context has a valid as_nr, which is only the case
-	 * when it's scheduled in.
-	 *
-	 * as_nr won't change because the caller has the runpool_irq lock */
-	KBASE_DEBUG_ASSERT(kctx->as_nr != KBASEP_AS_NR_INVALID);
-
-	kctx->kbdev->mmu_mode->disable_as(kctx->kbdev, kctx->as_nr);
-}
-
-KBASE_EXPORT_TEST_API(kbase_mmu_disable);
-
-void kbase_mmu_disable_as(struct kbase_device *kbdev, int as_nr)
-{
-	kbdev->mmu_mode->disable_as(kbdev, as_nr);
-}
 
 int kbase_gpu_mmap(struct kbase_context *kctx, struct kbase_va_region *reg, u64 addr, size_t nr_pages, size_t align)
 {
@@ -1181,12 +1151,7 @@ int kbase_mem_free_region(struct kbase_context *kctx, struct kbase_va_region *re
 		dev_warn(reg->kctx->kbdev->dev, "Could not unmap from the GPU...\n");
 		goto out;
 	}
-#ifndef CONFIG_MALI_NO_MALI
-	if (kbase_hw_has_issue(kctx->kbdev, BASE_HW_ISSUE_6367)) {
-		/* Wait for GPU to flush write buffer before freeing physical pages */
-		kbase_wait_write_flush(kctx);
-	}
-#endif
+
 	/* This will also free the physical pages */
 	kbase_free_alloced_region(reg);
 
@@ -1608,6 +1573,7 @@ void kbase_gpu_vm_unlock(struct kbase_context *kctx)
 
 KBASE_EXPORT_TEST_API(kbase_gpu_vm_unlock);
 
+#ifdef CONFIG_DEBUG_FS
 struct kbase_jit_debugfs_data {
 	int (*func)(struct kbase_jit_debugfs_data *);
 	struct mutex lock;
@@ -1784,6 +1750,7 @@ void kbase_jit_debugfs_add(struct kbase_context *kctx)
 	debugfs_create_file("mem_jit_phys", S_IRUGO, kctx->kctx_dentry,
 			kctx, &kbase_jit_debugfs_phys_fops);
 }
+#endif /* CONFIG_DEBUG_FS */
 
 /**
  * kbase_jit_destroy_worker - Deferred worker which frees JIT allocations
@@ -2276,26 +2243,15 @@ struct kbase_mem_phy_alloc *kbase_map_external_resource(
 		struct mm_struct *locked_mm
 #ifdef CONFIG_KDS
 		, u32 *kds_res_count, struct kds_resource **kds_resources,
-		unsigned long *kds_access_bitmap
+		unsigned long *kds_access_bitmap, bool exclusive
 #endif
-#ifdef CONFIG_DRM_DMA_SYNC
-		, unsigned int *num_resvs, struct reservation_object **resvs,
-		unsigned long *excl_resvs_bitmap
-#endif
-#if defined(CONFIG_KDS) || defined(CONFIG_DRM_DMA_SYNC)
-		, bool exclusive
-#ifdef CONFIG_SYNC
-		, bool implicit_sync
-#endif
-#endif
-
 		)
 {
 	int err;
 
 	/* decide what needs to happen for this resource */
 	switch (reg->gpu_alloc->type) {
-	case BASE_MEM_IMPORT_TYPE_USER_BUFFER: {
+	case KBASE_MEM_TYPE_IMPORTED_USER_BUF: {
 		if (reg->gpu_alloc->imported.user_buf.mm != locked_mm)
 			goto exit;
 
@@ -2309,7 +2265,7 @@ struct kbase_mem_phy_alloc *kbase_map_external_resource(
 		}
 	}
 	break;
-	case BASE_MEM_IMPORT_TYPE_UMP: {
+	case KBASE_MEM_TYPE_IMPORTED_UMP: {
 #if defined(CONFIG_KDS) && defined(CONFIG_UMP)
 		if (kds_res_count) {
 			struct kds_resource *kds_res;
@@ -2325,39 +2281,19 @@ struct kbase_mem_phy_alloc *kbase_map_external_resource(
 		break;
 	}
 #ifdef CONFIG_DMA_SHARED_BUFFER
-	case BASE_MEM_IMPORT_TYPE_UMM: {
+	case KBASE_MEM_TYPE_IMPORTED_UMM: {
 #ifdef CONFIG_DMA_SHARED_BUFFER_USES_KDS
 		if (kds_res_count) {
 			struct kds_resource *kds_res;
 
 			kds_res = get_dma_buf_kds_resource(
 					reg->gpu_alloc->imported.umm.dma_buf);
-			if (kds_res
-#ifdef CONFIG_SYNC
-			    && implicit_sync
-#endif
-			   )
-
+			if (kds_res)
 				add_kds_resource(kds_res, kds_resources,
 						kds_res_count,
 						kds_access_bitmap, exclusive);
 		}
 #endif
-#ifdef CONFIG_DRM_DMA_SYNC
-				struct reservation_object *resv =
-					reg->gpu_alloc->imported.umm.dma_buf->resv;
-				if (resv
-#ifdef CONFIG_SYNC
-				    && implicit_sync
-#endif
-				) {
-					drm_add_reservation(resv,
-						resvs, excl_resvs_bitmap,
-						num_resvs,
-						exclusive);
-				}
-#endif
-
 		reg->gpu_alloc->imported.umm.current_mapping_usage_count++;
 		if (1 == reg->gpu_alloc->imported.umm.current_mapping_usage_count) {
 			err = kbase_jd_umm_map(kctx, reg);
@@ -2463,16 +2399,8 @@ struct kbase_ctx_ext_res_meta *kbase_sticky_resource_acquire(
 		 */
 		meta->alloc = kbase_map_external_resource(kctx, reg, NULL
 #ifdef CONFIG_KDS
-				, NULL, NULL, NULL
-#endif
-#ifdef CONFIG_DRM_DMA_SYNC
-				, NULL, NULL, NULL
-#endif
-#if defined(CONFIG_KDS) || defined(CONFIG_DRM_DMA_SYNC)
-				, false
-#ifdef CONFIG_SYNC
-				, false
-#endif
+				, NULL, NULL,
+				NULL, false
 #endif
 				);
 

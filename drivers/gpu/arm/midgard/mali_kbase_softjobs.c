@@ -53,11 +53,44 @@ void kbasep_add_waiting_soft_job(struct kbase_jd_atom *katom)
 	unsigned long lflags;
 
 	spin_lock_irqsave(&kctx->waiting_soft_jobs_lock, lflags);
-	list_add_tail(&katom->dep_item[0], &kctx->waiting_soft_jobs);
+	list_add_tail(&katom->queue, &kctx->waiting_soft_jobs);
 	spin_unlock_irqrestore(&kctx->waiting_soft_jobs_lock, lflags);
 }
 
-int kbasep_read_soft_event_status(
+void kbasep_remove_waiting_soft_job(struct kbase_jd_atom *katom)
+{
+	struct kbase_context *kctx = katom->kctx;
+	unsigned long lflags;
+
+	spin_lock_irqsave(&kctx->waiting_soft_jobs_lock, lflags);
+	list_del(&katom->queue);
+	spin_unlock_irqrestore(&kctx->waiting_soft_jobs_lock, lflags);
+}
+
+static void kbasep_add_waiting_with_timeout(struct kbase_jd_atom *katom)
+{
+	struct kbase_context *kctx = katom->kctx;
+
+	/* Record the start time of this atom so we could cancel it at
+	 * the right time.
+	 */
+	katom->start_timestamp = ktime_get();
+
+	/* Add the atom to the waiting list before the timer is
+	 * (re)started to make sure that it gets processed.
+	 */
+	kbasep_add_waiting_soft_job(katom);
+
+	/* Schedule timeout of this atom after a period if it is not active */
+	if (!timer_pending(&kctx->soft_job_timeout)) {
+		int timeout_ms = atomic_read(
+				&kctx->kbdev->js_data.soft_job_timeout_ms);
+		mod_timer(&kctx->soft_job_timeout,
+			  jiffies + msecs_to_jiffies(timeout_ms));
+	}
+}
+
+static int kbasep_read_soft_event_status(
 		struct kbase_context *kctx, u64 evt, unsigned char *status)
 {
 	unsigned char *mapped_evt;
@@ -74,7 +107,7 @@ int kbasep_read_soft_event_status(
 	return 0;
 }
 
-int kbasep_write_soft_event_status(
+static int kbasep_write_soft_event_status(
 		struct kbase_context *kctx, u64 evt, unsigned char new_status)
 {
 	unsigned char *mapped_evt;
@@ -117,7 +150,9 @@ static int kbase_dump_cpu_gpu_time(struct kbase_jd_atom *katom)
 		struct kbasep_js_device_data *js_devdata = &kctx->kbdev->js_data;
 
 		/* We're suspended - queue this on the list of suspended jobs
-		 * Use dep_item[1], because dep_item[0] is in use for 'waiting_soft_jobs' */
+		 * Use dep_item[1], because dep_item[0] was previously in use
+		 * for 'waiting_soft_jobs'.
+		 */
 		mutex_lock(&js_devdata->runpool_mutex);
 		list_add_tail(&katom->dep_item[1], &js_devdata->suspended_soft_jobs_list);
 		mutex_unlock(&js_devdata->runpool_mutex);
@@ -161,22 +196,6 @@ static int kbase_dump_cpu_gpu_time(struct kbase_jd_atom *katom)
 
 #ifdef CONFIG_SYNC
 
-/* Complete an atom that has returned '1' from kbase_process_soft_job (i.e. has waited)
- *
- * @param katom     The atom to complete
- */
-static void complete_soft_job(struct kbase_jd_atom *katom)
-{
-	struct kbase_context *kctx = katom->kctx;
-
-	mutex_lock(&kctx->jctx.lock);
-	list_del(&katom->dep_item[0]);
-	kbase_finish_soft_job(katom);
-	if (jd_done_nolock(katom, NULL))
-		kbase_js_sched_all(kctx->kbdev);
-	mutex_unlock(&kctx->jctx.lock);
-}
-
 static enum base_jd_event_code kbase_fence_trigger(struct kbase_jd_atom *katom, int result)
 {
 	struct sync_pt *pt;
@@ -218,7 +237,12 @@ static void kbase_fence_wait_worker(struct work_struct *data)
 	katom = container_of(data, struct kbase_jd_atom, work);
 	kctx = katom->kctx;
 
-	complete_soft_job(katom);
+	mutex_lock(&kctx->jctx.lock);
+	kbasep_remove_waiting_soft_job(katom);
+	kbase_finish_soft_job(katom);
+	if (jd_done_nolock(katom, NULL))
+		kbase_js_sched_all(kctx->kbdev);
+	mutex_unlock(&kctx->jctx.lock);
 }
 
 static void kbase_fence_wait_callback(struct sync_fence *fence, struct sync_fence_waiter *waiter)
@@ -235,11 +259,7 @@ static void kbase_fence_wait_callback(struct sync_fence *fence, struct sync_fenc
 	/* Propagate the fence status to the atom.
 	 * If negative then cancel this atom and its dependencies.
 	 */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0)
-	if (fence->status < 0)
-#else
-	if (atomic_read(&fence->status) < 0)
-#endif
+	if (kbase_fence_get_status(fence) < 0)
 		katom->event_code = BASE_JD_EVENT_JOB_CANCELLED;
 
 	/* To prevent a potential deadlock we schedule the work onto the job_done_wq workqueue
@@ -278,7 +298,13 @@ static int kbase_fence_wait(struct kbase_jd_atom *katom)
 		queue_work(katom->kctx->jctx.job_done_wq, &katom->work);
 	}
 
+#ifdef CONFIG_MALI_FENCE_DEBUG
+	/* The timeout code will add this job to the list of waiting soft jobs.
+	 */
+	kbasep_add_waiting_with_timeout(katom);
+#else
 	kbasep_add_waiting_soft_job(katom);
+#endif
 
 	return 1;
 }
@@ -293,6 +319,7 @@ static void kbase_fence_cancel_wait(struct kbase_jd_atom *katom)
 	/* Wait was cancelled - zap the atoms */
 	katom->event_code = BASE_JD_EVENT_JOB_CANCELLED;
 
+	kbasep_remove_waiting_soft_job(katom);
 	kbase_finish_soft_job(katom);
 
 	if (jd_done_nolock(katom, NULL))
@@ -324,12 +351,12 @@ void kbasep_complete_triggered_soft_events(struct kbase_context *kctx, u64 evt)
 	spin_lock_irqsave(&kctx->waiting_soft_jobs_lock, lflags);
 	list_for_each_safe(entry, tmp, &kctx->waiting_soft_jobs) {
 		struct kbase_jd_atom *katom = list_entry(
-				entry, struct kbase_jd_atom, dep_item[0]);
+				entry, struct kbase_jd_atom, queue);
 
-		if ((katom->core_req & BASEP_JD_REQ_ATOM_TYPE) ==
-		    BASE_JD_REQ_SOFT_EVENT_WAIT) {
+		switch (katom->core_req & BASE_JD_REQ_SOFT_JOB_TYPE) {
+		case BASE_JD_REQ_SOFT_EVENT_WAIT:
 			if (katom->jc == evt) {
-				list_del(&katom->dep_item[0]);
+				list_del(&katom->queue);
 
 				katom->event_code = BASE_JD_EVENT_DONE;
 				INIT_WORK(&katom->work,
@@ -338,69 +365,192 @@ void kbasep_complete_triggered_soft_events(struct kbase_context *kctx, u64 evt)
 					   &katom->work);
 			} else {
 				/* There are still other waiting jobs, we cannot
-				 * cancel the timer yet */
+				 * cancel the timer yet.
+				 */
 				cancel_timer = 0;
 			}
+			break;
+#ifdef CONFIG_MALI_FENCE_DEBUG
+		case BASE_JD_REQ_SOFT_FENCE_WAIT:
+			/* Keep the timer running if fence debug is enabled and
+			 * there are waiting fence jobs.
+			 */
+			cancel_timer = 0;
+			break;
+#endif
 		}
 	}
 
 	if (cancel_timer)
-		hrtimer_try_to_cancel(&kctx->soft_event_timeout);
+		del_timer(&kctx->soft_job_timeout);
 	spin_unlock_irqrestore(&kctx->waiting_soft_jobs_lock, lflags);
 }
 
-enum hrtimer_restart kbasep_soft_event_timeout_worker(struct hrtimer *timer)
+#ifdef CONFIG_MALI_FENCE_DEBUG
+static char *kbase_fence_debug_status_string(int status)
 {
-	struct kbase_context *kctx = container_of(timer, struct kbase_context,
-			soft_event_timeout);
+	if (status == 0)
+		return "signaled";
+	else if (status > 0)
+		return "active";
+	else
+		return "error";
+}
+
+static void kbase_fence_debug_check_atom(struct kbase_jd_atom *katom)
+{
+	struct kbase_context *kctx = katom->kctx;
+	struct device *dev = kctx->kbdev->dev;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		struct kbase_jd_atom *dep;
+
+		list_for_each_entry(dep, &katom->dep_head[i], dep_item[i]) {
+			if (dep->status == KBASE_JD_ATOM_STATE_UNUSED ||
+			    dep->status == KBASE_JD_ATOM_STATE_COMPLETED)
+				continue;
+
+			if ((dep->core_req & BASE_JD_REQ_SOFT_JOB_TYPE)
+					== BASE_JD_REQ_SOFT_FENCE_TRIGGER) {
+				struct sync_fence *fence = dep->fence;
+				int status = kbase_fence_get_status(fence);
+
+				/* Found blocked trigger fence. */
+				dev_warn(dev,
+					 "\tVictim trigger atom %d fence [%p] %s: %s\n",
+					 kbase_jd_atom_id(kctx, dep),
+					 fence, fence->name,
+					 kbase_fence_debug_status_string(status));
+			}
+
+			kbase_fence_debug_check_atom(dep);
+		}
+	}
+}
+
+static void kbase_fence_debug_wait_timeout(struct kbase_jd_atom *katom)
+{
+	struct kbase_context *kctx = katom->kctx;
+	struct device *dev = katom->kctx->kbdev->dev;
+	struct sync_fence *fence = katom->fence;
+	int timeout_ms = atomic_read(&kctx->kbdev->js_data.soft_job_timeout_ms);
+	int status = kbase_fence_get_status(fence);
+	unsigned long lflags;
+
+	spin_lock_irqsave(&kctx->waiting_soft_jobs_lock, lflags);
+
+	dev_warn(dev, "ctx %d_%d: Atom %d still waiting for fence [%p] after %dms\n",
+		 kctx->tgid, kctx->id,
+		 kbase_jd_atom_id(kctx, katom),
+		 fence, timeout_ms);
+	dev_warn(dev, "\tGuilty fence [%p] %s: %s\n",
+		 fence, fence->name,
+		 kbase_fence_debug_status_string(status));
+
+	/* Search for blocked trigger atoms */
+	kbase_fence_debug_check_atom(katom);
+
+	spin_unlock_irqrestore(&kctx->waiting_soft_jobs_lock, lflags);
+
+	/* Dump out the full state of all the Android sync fences.
+	 * The function sync_dump() isn't exported to modules, so force
+	 * sync_fence_wait() to time out to trigger sync_dump().
+	 */
+	sync_fence_wait(fence, 1);
+}
+
+struct kbase_fence_debug_work {
+	struct kbase_jd_atom *katom;
+	struct work_struct work;
+};
+
+static void kbase_fence_debug_wait_timeout_worker(struct work_struct *work)
+{
+	struct kbase_fence_debug_work *w = container_of(work,
+			struct kbase_fence_debug_work, work);
+	struct kbase_jd_atom *katom = w->katom;
+	struct kbase_context *kctx = katom->kctx;
+
+	mutex_lock(&kctx->jctx.lock);
+	kbase_fence_debug_wait_timeout(katom);
+	mutex_unlock(&kctx->jctx.lock);
+
+	kfree(w);
+}
+
+static void kbase_fence_debug_timeout(struct kbase_jd_atom *katom)
+{
+	struct kbase_fence_debug_work *work;
+	struct kbase_context *kctx = katom->kctx;
+
+	/* Enqueue fence debug worker. Use job_done_wq to get
+	 * debug print ordered with job completion.
+	 */
+	work = kzalloc(sizeof(struct kbase_fence_debug_work), GFP_ATOMIC);
+	/* Ignore allocation failure. */
+	if (work) {
+		work->katom = katom;
+		INIT_WORK(&work->work, kbase_fence_debug_wait_timeout_worker);
+		queue_work(kctx->jctx.job_done_wq, &work->work);
+	}
+}
+#endif /* CONFIG_MALI_FENCE_DEBUG */
+
+void kbasep_soft_job_timeout_worker(unsigned long data)
+{
+	struct kbase_context *kctx = (struct kbase_context *)data;
 	u32 timeout_ms = (u32)atomic_read(
-			&kctx->kbdev->js_data.soft_event_timeout_ms);
+			&kctx->kbdev->js_data.soft_job_timeout_ms);
+	struct timer_list *timer = &kctx->soft_job_timeout;
 	ktime_t cur_time = ktime_get();
-	enum hrtimer_restart restarting = HRTIMER_NORESTART;
+	bool restarting = false;
 	unsigned long lflags;
 	struct list_head *entry, *tmp;
 
 	spin_lock_irqsave(&kctx->waiting_soft_jobs_lock, lflags);
 	list_for_each_safe(entry, tmp, &kctx->waiting_soft_jobs) {
-		struct kbase_jd_atom *katom = list_entry(
-				entry, struct kbase_jd_atom, dep_item[0]);
+		struct kbase_jd_atom *katom = list_entry(entry,
+				struct kbase_jd_atom, queue);
+		s64 elapsed_time = ktime_to_ms(ktime_sub(cur_time,
+					katom->start_timestamp));
 
-		if ((katom->core_req & BASEP_JD_REQ_ATOM_TYPE) ==
-		    BASE_JD_REQ_SOFT_EVENT_WAIT) {
-			s64 elapsed_time =
-				ktime_to_ms(ktime_sub(cur_time,
-						      katom->start_timestamp));
-			if (elapsed_time > (s64)timeout_ms) {
-				/* Take it out of the list to ensure that it
-				 * will be cancelled in all cases */
-				list_del(&katom->dep_item[0]);
+		if (elapsed_time < (s64)timeout_ms) {
+			restarting = true;
+			continue;
+		}
 
-				katom->event_code = BASE_JD_EVENT_JOB_CANCELLED;
-				INIT_WORK(&katom->work,
-					  kbasep_soft_event_complete_job);
-				queue_work(kctx->jctx.job_done_wq,
-					   &katom->work);
-			} else {
-				restarting = HRTIMER_RESTART;
-			}
+		switch (katom->core_req & BASE_JD_REQ_SOFT_JOB_TYPE) {
+		case BASE_JD_REQ_SOFT_EVENT_WAIT:
+			/* Take it out of the list to ensure that it
+			 * will be cancelled in all cases
+			 */
+			list_del(&katom->queue);
+
+			katom->event_code = BASE_JD_EVENT_JOB_CANCELLED;
+			INIT_WORK(&katom->work, kbasep_soft_event_complete_job);
+			queue_work(kctx->jctx.job_done_wq, &katom->work);
+			break;
+#ifdef CONFIG_MALI_FENCE_DEBUG
+		case BASE_JD_REQ_SOFT_FENCE_WAIT:
+			kbase_fence_debug_timeout(katom);
+			break;
+#endif
 		}
 	}
 
 	if (restarting)
-		hrtimer_add_expires(timer, HR_TIMER_DELAY_MSEC(timeout_ms));
+		mod_timer(timer, jiffies + msecs_to_jiffies(timeout_ms));
 	spin_unlock_irqrestore(&kctx->waiting_soft_jobs_lock, lflags);
-
-	return restarting;
 }
 
 static int kbasep_soft_event_wait(struct kbase_jd_atom *katom)
 {
 	struct kbase_context *kctx = katom->kctx;
-	ktime_t remaining;
 	unsigned char status;
 
 	/* The status of this soft-job is stored in jc */
-	if (kbasep_read_soft_event_status(kctx, katom->jc, &status) != 0) {
+	if (kbasep_read_soft_event_status(kctx, katom->jc, &status)) {
 		katom->event_code = BASE_JD_EVENT_JOB_CANCELLED;
 		return 0;
 	}
@@ -408,29 +558,12 @@ static int kbasep_soft_event_wait(struct kbase_jd_atom *katom)
 	if (status == BASE_JD_SOFT_EVENT_SET)
 		return 0; /* Event already set, nothing to do */
 
-	/* Record the start time of this atom so we could cancel it at
-	 * the right time */
-	katom->start_timestamp = ktime_get();
-
-	/* Add the atom to the waiting list before the timer is
-	 * (re)started to make sure that it gets processed */
-	kbasep_add_waiting_soft_job(katom);
-
-	/* Schedule cancellation of this atom after a period if it is
-	 * not active */
-	remaining = hrtimer_get_remaining(&kctx->soft_event_timeout);
-	if (remaining.tv64 <= 0) {
-		int timeout_ms = atomic_read(
-				&kctx->kbdev->js_data.soft_event_timeout_ms);
-		hrtimer_start(&kctx->soft_event_timeout,
-			      HR_TIMER_DELAY_MSEC((u64)timeout_ms),
-			      HRTIMER_MODE_REL);
-	}
+	kbasep_add_waiting_with_timeout(katom);
 
 	return 1;
 }
 
-static void kbasep_soft_event_update(struct kbase_jd_atom *katom,
+static void kbasep_soft_event_update_locked(struct kbase_jd_atom *katom,
 				     unsigned char new_status)
 {
 	/* Complete jobs waiting on the same event */
@@ -443,6 +576,38 @@ static void kbasep_soft_event_update(struct kbase_jd_atom *katom,
 
 	if (new_status == BASE_JD_SOFT_EVENT_SET)
 		kbasep_complete_triggered_soft_events(kctx, katom->jc);
+}
+
+/**
+ * kbase_soft_event_update() - Update soft event state
+ * @kctx: Pointer to context
+ * @event: Event to update
+ * @new_status: New status value of event
+ *
+ * Update the event, and wake up any atoms waiting for the event.
+ *
+ * Return: 0 on success, a negative error code on failure.
+ */
+int kbase_soft_event_update(struct kbase_context *kctx,
+			     u64 event,
+			     unsigned char new_status)
+{
+	int err = 0;
+
+	mutex_lock(&kctx->jctx.lock);
+
+	if (kbasep_write_soft_event_status(kctx, event, new_status)) {
+		err = -ENOENT;
+		goto out;
+	}
+
+	if (new_status == BASE_JD_SOFT_EVENT_SET)
+		kbasep_complete_triggered_soft_events(kctx, event);
+
+out:
+	mutex_unlock(&kctx->jctx.lock);
+
+	return err;
 }
 
 static void kbasep_soft_event_cancel_job(struct kbase_jd_atom *katom)
@@ -511,7 +676,7 @@ static void kbase_debug_copy_finish(struct kbase_jd_atom *katom)
 		kfree(buffers[i].pages);
 		if (reg && reg->gpu_alloc) {
 			switch (reg->gpu_alloc->type) {
-			case BASE_MEM_IMPORT_TYPE_USER_BUFFER:
+			case KBASE_MEM_TYPE_IMPORTED_USER_BUF:
 			{
 				free_user_buffer(&buffers[i]);
 				break;
@@ -626,7 +791,7 @@ static int kbase_debug_copy_prepare(struct kbase_jd_atom *katom)
 			dev_warn(katom->kctx->kbdev->dev, "Copy buffer is not of same size as the external resource to copy.\n");
 
 		switch (reg->gpu_alloc->type) {
-		case BASE_MEM_IMPORT_TYPE_USER_BUFFER:
+		case KBASE_MEM_TYPE_IMPORTED_USER_BUF:
 		{
 			struct kbase_mem_phy_alloc *alloc = reg->gpu_alloc;
 			unsigned long nr_pages =
@@ -652,7 +817,7 @@ static int kbase_debug_copy_prepare(struct kbase_jd_atom *katom)
 			ret = 0;
 			break;
 		}
-		case BASE_MEM_IMPORT_TYPE_UMP:
+		case KBASE_MEM_TYPE_IMPORTED_UMP:
 		{
 			dev_warn(katom->kctx->kbdev->dev,
 					"UMP is not supported for debug_copy jobs\n");
@@ -746,7 +911,7 @@ static int kbase_mem_copy_from_extres(struct kbase_context *kctx,
 	}
 
 	switch (reg->gpu_alloc->type) {
-	case BASE_MEM_IMPORT_TYPE_USER_BUFFER:
+	case KBASE_MEM_TYPE_IMPORTED_USER_BUF:
 	{
 		for (i = 0; i < buf_data->nr_extres_pages; i++) {
 			struct page *pg = buf_data->extres_pages[i];
@@ -767,7 +932,7 @@ static int kbase_mem_copy_from_extres(struct kbase_context *kctx,
 	}
 	break;
 #ifdef CONFIG_DMA_SHARED_BUFFER
-	case BASE_MEM_IMPORT_TYPE_UMM: {
+	case KBASE_MEM_TYPE_IMPORTED_UMM: {
 		struct dma_buf *dma_buf = reg->gpu_alloc->imported.umm.dma_buf;
 
 		KBASE_DEBUG_ASSERT(dma_buf != NULL);
@@ -775,7 +940,7 @@ static int kbase_mem_copy_from_extres(struct kbase_context *kctx,
 				   buf_data->nr_extres_pages * PAGE_SIZE);
 
 		ret = dma_buf_begin_cpu_access(dma_buf,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0) && !defined(CONFIG_CHROMEOS)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
 				0, buf_data->nr_extres_pages*PAGE_SIZE,
 #endif
 				DMA_FROM_DEVICE);
@@ -798,7 +963,7 @@ static int kbase_mem_copy_from_extres(struct kbase_context *kctx,
 				break;
 		}
 		dma_buf_end_cpu_access(dma_buf,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0) && !defined(CONFIG_CHROMEOS)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
 				0, buf_data->nr_extres_pages*PAGE_SIZE,
 #endif
 				DMA_FROM_DEVICE);
@@ -1114,14 +1279,11 @@ static void kbase_ext_res_finish(struct kbase_jd_atom *katom)
 
 int kbase_process_soft_job(struct kbase_jd_atom *katom)
 {
-	switch (katom->core_req & BASEP_JD_REQ_ATOM_TYPE) {
+	switch (katom->core_req & BASE_JD_REQ_SOFT_JOB_TYPE) {
 	case BASE_JD_REQ_SOFT_DUMP_CPU_GPU_TIME:
 		return kbase_dump_cpu_gpu_time(katom);
 #ifdef CONFIG_SYNC
 	case BASE_JD_REQ_SOFT_FENCE_TRIGGER:
-#if defined(CONFIG_KDS) || defined(CONFIG_DRM_DMA_SYNC)
-		katom->kctx->jctx.implicit_sync = false;
-#endif				/* CONFIG_KDS or CONFIG_DRM_DMA_SYNC */
 		KBASE_DEBUG_ASSERT(katom->fence != NULL);
 		katom->event_code = kbase_fence_trigger(katom, katom->event_code == BASE_JD_EVENT_DONE ? 0 : -EFAULT);
 		/* Release the reference as we don't need it any more */
@@ -1129,9 +1291,6 @@ int kbase_process_soft_job(struct kbase_jd_atom *katom)
 		katom->fence = NULL;
 		break;
 	case BASE_JD_REQ_SOFT_FENCE_WAIT:
-#if defined(CONFIG_KDS) || defined(CONFIG_DRM_DMA_SYNC)
-		katom->kctx->jctx.implicit_sync = false;
-#endif				/* CONFIG_KDS or CONFIG_DRM_DMA_SYNC */
 		return kbase_fence_wait(katom);
 #endif				/* CONFIG_SYNC */
 	case BASE_JD_REQ_SOFT_REPLAY:
@@ -1139,10 +1298,10 @@ int kbase_process_soft_job(struct kbase_jd_atom *katom)
 	case BASE_JD_REQ_SOFT_EVENT_WAIT:
 		return kbasep_soft_event_wait(katom);
 	case BASE_JD_REQ_SOFT_EVENT_SET:
-		kbasep_soft_event_update(katom, BASE_JD_SOFT_EVENT_SET);
+		kbasep_soft_event_update_locked(katom, BASE_JD_SOFT_EVENT_SET);
 		break;
 	case BASE_JD_REQ_SOFT_EVENT_RESET:
-		kbasep_soft_event_update(katom, BASE_JD_SOFT_EVENT_RESET);
+		kbasep_soft_event_update_locked(katom, BASE_JD_SOFT_EVENT_RESET);
 		break;
 	case BASE_JD_REQ_SOFT_DEBUG_COPY:
 	{
@@ -1172,7 +1331,7 @@ int kbase_process_soft_job(struct kbase_jd_atom *katom)
 
 void kbase_cancel_soft_job(struct kbase_jd_atom *katom)
 {
-	switch (katom->core_req & BASEP_JD_REQ_ATOM_TYPE) {
+	switch (katom->core_req & BASE_JD_REQ_SOFT_JOB_TYPE) {
 #ifdef CONFIG_SYNC
 	case BASE_JD_REQ_SOFT_FENCE_WAIT:
 		kbase_fence_cancel_wait(katom);
@@ -1189,7 +1348,7 @@ void kbase_cancel_soft_job(struct kbase_jd_atom *katom)
 
 int kbase_prepare_soft_job(struct kbase_jd_atom *katom)
 {
-	switch (katom->core_req & BASEP_JD_REQ_ATOM_TYPE) {
+	switch (katom->core_req & BASE_JD_REQ_SOFT_JOB_TYPE) {
 	case BASE_JD_REQ_SOFT_DUMP_CPU_GPU_TIME:
 		{
 			if (0 != (katom->jc & KBASE_CACHE_ALIGNMENT_MASK))
@@ -1264,7 +1423,7 @@ int kbase_prepare_soft_job(struct kbase_jd_atom *katom)
 
 void kbase_finish_soft_job(struct kbase_jd_atom *katom)
 {
-	switch (katom->core_req & BASEP_JD_REQ_ATOM_TYPE) {
+	switch (katom->core_req & BASE_JD_REQ_SOFT_JOB_TYPE) {
 	case BASE_JD_REQ_SOFT_DUMP_CPU_GPU_TIME:
 		/* Nothing to do */
 		break;
@@ -1331,14 +1490,14 @@ void kbase_resume_suspended_soft_jobs(struct kbase_device *kbdev)
 		/* Remove from the global list */
 		list_del(&katom_iter->dep_item[1]);
 		/* Remove from the context's list of waiting soft jobs */
-		list_del(&katom_iter->dep_item[0]);
+		kbasep_remove_waiting_soft_job(katom_iter);
 
 		if (kbase_process_soft_job(katom_iter) == 0) {
 			kbase_finish_soft_job(katom_iter);
 			resched |= jd_done_nolock(katom_iter, NULL);
 		} else {
 			KBASE_DEBUG_ASSERT((katom_iter->core_req &
-					BASEP_JD_REQ_ATOM_TYPE)
+					BASE_JD_REQ_SOFT_JOB_TYPE)
 					!= BASE_JD_REQ_SOFT_REPLAY);
 		}
 

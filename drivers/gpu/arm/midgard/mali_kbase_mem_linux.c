@@ -1086,7 +1086,7 @@ static struct kbase_va_region *kbase_mem_from_umm(struct kbase_context *kctx, in
 
 	/* no read or write permission given on import, only on run do we give the right permissions */
 
-	reg->gpu_alloc->type = BASE_MEM_IMPORT_TYPE_UMM;
+	reg->gpu_alloc->type = KBASE_MEM_TYPE_IMPORTED_UMM;
 	reg->gpu_alloc->imported.umm.sgt = NULL;
 	reg->gpu_alloc->imported.umm.dma_buf = dma_buf;
 	reg->gpu_alloc->imported.umm.dma_attachment = dma_attachment;
@@ -1656,18 +1656,6 @@ static int kbase_mem_shrink_gpu_mapping(struct kbase_context *kctx,
 
 	ret = kbase_mmu_teardown_pages(kctx,
 			reg->start_pfn + new_pages, delta);
-	if (ret)
-		return ret;
-
-#ifndef CONFIG_MALI_NO_MALI
-	if (kbase_hw_has_issue(kctx->kbdev, BASE_HW_ISSUE_6367)) {
-		/*
-		* Wait for GPU to flush write buffer before freeing
-		* physical pages.
-		 */
-		kbase_wait_write_flush(kctx);
-	}
-#endif
 
 	return ret;
 }
