@@ -77,7 +77,7 @@
 #define CONT_MODE_IR			2
 #define CONT_MODE_PROX			3
 
-static const char const *isl29018_cont_modes[] = {
+static const char *isl29018_cont_modes[] = {
 	"once",
 	"als",
 	"ir",
